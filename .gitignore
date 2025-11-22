@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environment (Poetry usually manages .venv)
+.venv/
+.env/
+venv/
+ENV/
+env/
+.env
+
+# --- Poetry ---
+poetry.lock
+# (Optional) If you want deterministic builds, keep poetry.lock
+# Remove the above line if you DO want the lockfile in Git
+
+# --- macOS ---
+.DS_Store
+
+# --- VSCode ---
+.vscode/
+*.code-workspace
+
+# --- Bytecode / Caches ---
+.cache/
+pytest_cache/
+.mypy_cache/
+.pytest_cache/
+
+# --- Build artifacts ---
+build/
+dist/
+site/
