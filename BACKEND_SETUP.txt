@@ -1,0 +1,25 @@
+STEP 1: Install Python dependencies
+===================================
+cd /Users/guochenjun/Documents/interface/finalproject/backend
+pip install -r requirements.txt
+
+STEP 2: Start the backend server
+================================
+cd /Users/guochenjun/Documents/interface/finalproject/backend
+python main.py
+
+This will start the backend on http://127.0.0.1:8000
+
+STEP 3: Verify it's running
+===========================
+In another terminal:
+curl http://127.0.0.1:8000
+
+Should see: {"message": "Um Actually Backend API", "version": "1.0.0"}
+
+STEP 4: Start frontend (in another terminal)
+=============================================
+cd /Users/guochenjun/Documents/interface/finalproject/um-actually-frontend
+npm run dev
+
+Then go to http://localhost:5173 and paste a YouTube URL!
