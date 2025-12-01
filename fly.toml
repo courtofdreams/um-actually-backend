@@ -1,0 +1,80 @@
+# fly.toml app configuration file
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+# IMPORTANT: Update this with your actual Fly.io app name
+# Run: fly apps create <your-app-name>
+app = "um-actually-backend" 
+primary_region = "sjc"  # San Jose - choose closest to your users
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "suspend"  # Stop machines when not in use
+  auto_start_machines = true
+  min_machines_running = 0  # Scale to zero when idle (cost saving)
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+# Health checks
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  processes = ["app"]
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+    method = "get"
+    path = "/health"
+    protocol = "http"
+    [services.http_checks.headers]
+
+[env]
+  # Environment variables that are safe to commit
+  # NOTE: OpenAI API key should be set via: fly secrets set OPENAI_API_KEY=your-key-here
+  OPENAI_TEXT_MODEL = "gpt-4o-mini"  # More cost-effective than gpt-4
+  OPENAI_TEMPERATURE = "0.2"
+
+# VM Resources
+[vm]
+  memory = "512mb"  # Adjust based on your needs
+  cpu_kind = "shared"
+  cpus = 1
+
+# Deploy configuration
+[deploy]
+  strategy = "rolling"  # Zero-downtime deployment
+
+# Metrics (optional but recommended)
+[metrics]
+  port = 9091
+  path = "/metrics"
+

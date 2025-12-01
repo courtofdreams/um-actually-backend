@@ -1,4 +1,5 @@
 # Um Actually Backend
+
 This is the backend service for the "Um Actually" application, which provides text analysis and fact-checking functionalities using OpenAI's language models.
 
 
@@ -44,3 +45,34 @@ um-actually-backend/
 
 ## Testing
 To run tests, the text and youtube video on /demo folder.
+
+## Deployment
+
+### Initial Setup
+```bash
+# Install Fly CLI
+brew install flyctl
+
+# Login to Fly.io
+flyctl auth login
+
+# Update fly.toml line 8 with your app name
+# Create app
+flyctl apps create your-app-name
+
+# Set OpenAI API key
+flyctl secrets set OPENAI_API_KEY=your-openai-key
+
+# Deploy
+flyctl deploy
+```
+
+### CI/CD
+GitHub Actions auto-deploys on push to `main`. Add secret in repo Settings → Secrets:
+- `FLY_API_TOKEN` (get with `flyctl auth token`)
+
+### Production Config
+Update `main.py` line 17 CORS for production:
+```python
+origins = ["https://your-frontend-url.fly.dev", "http://localhost:3000"]
+```

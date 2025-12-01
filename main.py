@@ -13,8 +13,11 @@ app = FastAPI(
     version="1.0.0",
 )
 
-## TODO: tighten CORS in production
-origins = ["*"]
+
+origins = [
+    "https://um-actually-frontend.fly.dev",
+    "http://localhost:3000"
+]
 
 app.add_middleware(
     CORSMiddleware,
