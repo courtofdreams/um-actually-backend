@@ -1,3 +1,6 @@
+Step 0: 
+
+
 STEP 1: Install Python dependencies
 ===================================
 cd /Users/guochenjun/Documents/interface/finalproject/backend

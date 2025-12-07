@@ -1,8 +1,9 @@
-from fastapi import FastAPI  
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from api.routes.text_analysis import router as text_analysis_router
 from api.routes.transcript import router as transcript_router
+from api.routes.video_analysis import router as video_analysis_router
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +38,12 @@ app.include_router(
     transcript_router,
     prefix="/api",
     tags=["transcript"],
+)
+
+app.include_router(
+    video_analysis_router,
+    prefix="/api",
+    tags=["video-analysis"],
 )
 
 
