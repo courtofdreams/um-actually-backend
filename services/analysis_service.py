@@ -120,7 +120,7 @@ Return ONLY a single JSON object with this exact structure:
 
 Requirements:
 - "confidenceScores" = overall confidence in your fact-checking (0-100).
-- "reasoning" should explain your overall analysis approach and key findings.
+- "reasoning" should be a brief summary (around 50 words) explaining your overall analysis approach and key findings.
 
 CRITICAL REQUIREMENT - You MUST return ALL segments:
 - "segments" array MUST contain EVERY SINGLE segment from the input, in the SAME order.
@@ -167,7 +167,7 @@ def run_video_transcript_analysis_with_openai(
     ]
 
     # Filter to only first 2 minutes (120 seconds) for OpenAI analysis
-    MAX_DURATION_SECONDS = 120
+    MAX_DURATION_SECONDS = 180
     segments_to_analyze = [
         seg for seg in all_segments_data
         if seg["startTime"] < MAX_DURATION_SECONDS
