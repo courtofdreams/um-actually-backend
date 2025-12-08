@@ -12,11 +12,19 @@ poetry install
 ```
 
 ## Local Development
- Add your OpenAI API key to a `.env` file in the root directory:
+
+### Environment Variables
+Create a `.env` file in the root directory with:
 ```plaintext
+# Required: OpenAI API key for fact-checking analysis
 OPENAI_API_KEY=your_openai_api_key_here
+
+# Required: Tavily API key for real search results
+# Sign up for free at https://app.tavily.com/sign-up (1000 searches/month free)
+TAVILY_API_KEY=tvly-your-tavily-api-key-here
 ```
-To start the development server locally, run:
+
+### Start Development Server
 ```bash
 sh start_dev_server.sh
 ```
@@ -60,8 +68,9 @@ flyctl auth login
 # Create app
 flyctl apps create your-app-name
 
-# Set OpenAI API key
+# Set API keys
 flyctl secrets set OPENAI_API_KEY=your-openai-key
+flyctl secrets set TAVILY_API_KEY=tvly-your-tavily-api-key
 
 # Deploy
 flyctl deploy

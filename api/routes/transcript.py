@@ -216,7 +216,6 @@ def parse_vtt_captions(vtt_content: str) -> List[TranscriptSegment]:
             segment_id += 1
 
     return segments
-
 def parse_vtt_timestamp(timestamp_str: str) -> float:
     """
     Convert VTT timestamp to seconds.
@@ -232,3 +231,4 @@ def parse_vtt_timestamp(timestamp_str: str) -> float:
         return float(minutes) * 60 + float(seconds)
     else:
         return float(timestamp_str)
+

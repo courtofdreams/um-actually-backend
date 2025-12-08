@@ -1,1 +1,1 @@
-uvicorn main:app --reload --env-file .env
+poetry run uvicorn main:app --reload --env-file .env

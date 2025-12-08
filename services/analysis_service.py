@@ -4,50 +4,46 @@ from typing import Dict, Any, List
 from schemas.text_analysis import TextAnalysisResponse
 from schemas.video_analysis import VideoTranscriptAnalysisResponse, TranscriptSegment
 from services.openai_service import run_text_analysis
+from services.search_service import search_for_claim, TRUSTED_FACT_CHECK_DOMAINS
 
 
+# Updated prompt that focuses on identifying claims, not generating URLs
 TEXT_ANALYSIS_SYSTEM_PROMPT = """
 You are a fact-checking and text analysis assistant.
 
-Return ONLY a single JSON object with this exact structure and field names:
+Your job is to identify factual claims in the text and assess their verifiability.
+DO NOT make up URLs or sources - real sources will be found separately.
+
+Return ONLY a single JSON object with this exact structure:
 
 {
   "confidenceScores": number,
   "reasoning": string,
   "htmlContent": string,
-  "sourcesList": [
+  "claims": [
     {
       "claim": string,
+      "claimText": string,
       "confidenceReason": string,
       "ratingPercent": number,
-      "sources": [
-        {
-          "title": string,
-          "claimReference": string?,
-          "url": string,
-          "ratingStance": "Mostly Support" | "Partially Support" | "Opposite",
-          "snippet": string,
-          "datePosted": string
-        }
-      ]
+      "searchQuery": string
     }
   ]
 }
 
 Requirements:
-- "confidenceScores" = overall confidence in your fact-checking for the WHOLE text (0-100).
-- "htmlContent" should be the full text with inline markers from claim to numbers [1], [2], [3]... wrapped in <span class="marker"> claim [1] </span>. DO NOT add markers for sentences without claims.
+- "confidenceScores" = overall confidence in the factual accuracy of the WHOLE text (0-100).
+- "htmlContent" should be the full text with inline markers from claim to numbers [1], [2], [3]... wrapped in <span class="marker"> claim [1] </span>. DO NOT add markers for sentences without factual claims.
 - "reasoning" should explain your overall analysis approach and findings.
-- "sourcesList" should align those [n] markers with external sources.
-For each source in "sources":
-- "snippet" is a short excerpt from the source supporting your analysis.
-- "ratingStance" is your evaluation of the source's position relative to the claim.
-- "ratingPercent" is your confidence in that specific claim (0-100).
-- "url" is the direct link to the source.
-- "title" is the title of the source article or page.
-- "datePosted" is the publication date of the source.
-- "claimReference" is optional; include it if the source explicitly references the claim for example, the claim "The UK left the EU in 2019" might have a claimReference "left the EU in 2019".
+- "claims" should list each identified claim with:
+  - "claim": The claim being checked (e.g., "The UK left the EU in 2020")
+  - "claimText": The exact text from the source that contains this claim
+  - "confidenceReason": Why you rate this claim at this confidence level
+  - "ratingPercent": Your confidence in this claim (0-100) based on your knowledge
+  - "searchQuery": A good search query to find sources about this claim (for fact-checking)
+
 If you are uncertain or have limited information, lower ratingPercent and explain why in confidenceReason.
+Focus on identifying verifiable factual claims - dates, statistics, events, scientific facts, etc.
 """
 
 
@@ -68,12 +64,74 @@ def run_text_analysis_with_openai(text: str) -> TextAnalysisResponse:
             "confidenceScores": 0,
             "reasoning": "Model returned invalid JSON.",
             "htmlContent": text,
-            "sourcesList": [],
+            "claims": [],
         }
 
-    return TextAnalysisResponse(**data)
+    # Now search for real sources for each claim
+    claims = data.get("claims", [])
+    sources_list = []
+    
+    for i, claim_data in enumerate(claims):
+        claim_text = claim_data.get("claim", "")
+        search_query = claim_data.get("searchQuery", claim_text)
+        
+        # Search for real sources using Tavily
+        search_results = search_for_claim(
+            search_query,
+            max_results=3,
+            include_domains=TRUSTED_FACT_CHECK_DOMAINS[:10]  # Top trusted domains
+        )
+        
+        # Convert search results to our source format
+        sources = []
+        for result in search_results:
+            # Determine stance based on search result score and content
+            # This is a heuristic - higher scores generally mean more relevant/supportive
+            score = result.get("score", 0)
+            if score > 0.8:
+                stance = "Mostly Support"
+            elif score > 0.5:
+                stance = "Partially Support"
+            else:
+                stance = "Partially Support"  # Default to partial for found sources
+                
+            sources.append({
+                "title": result.get("title", "Unknown Source"),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+                "datePosted": result.get("published_date", "Unknown"),
+                "ratingStance": stance,
+                "claimReference": claim_data.get("claimText", ""),
+            })
+        
+        # If no sources found from search, note this
+        if not sources:
+            sources.append({
+                "title": "No verified sources found",
+                "url": "",
+                "snippet": "Unable to find verified sources for this claim. Please verify independently.",
+                "datePosted": "",
+                "ratingStance": "Partially Support",
+                "claimReference": claim_data.get("claimText", ""),
+            })
+        
+        sources_list.append({
+            "claim": claim_text,
+            "confidenceReason": claim_data.get("confidenceReason", ""),
+            "ratingPercent": claim_data.get("ratingPercent", 50),
+            "sources": sources,
+        })
+    
+    # Build final response
+    return TextAnalysisResponse(
+        confidenceScores=data.get("confidenceScores", 0),
+        reasoning=data.get("reasoning", ""),
+        htmlContent=data.get("htmlContent", text),
+        sourcesList=sources_list,
+    )
 
 
+# Updated video transcript prompt - focuses on claim identification
 VIDEO_TRANSCRIPT_ANALYSIS_SYSTEM_PROMPT = """
 You are a fact-checking assistant for video transcript analysis.
 
@@ -82,6 +140,9 @@ You will receive a list of transcript segments with timestamps. Each segment has
 - text: the spoken text
 - startTime: start time in seconds
 - endTime: end time in seconds
+
+Your job is to identify factual claims that can be verified.
+DO NOT make up URLs or sources - real sources will be found separately.
 
 Return ONLY a single JSON object with this exact structure:
 
@@ -99,28 +160,20 @@ Return ONLY a single JSON object with this exact structure:
       "claimIndex": number (optional)
     }
   ],
-  "sourcesList": [
+  "claims": [
     {
       "claim": string,
+      "claimText": string,
       "confidenceReason": string,
       "ratingPercent": number,
-      "sources": [
-        {
-          "title": string,
-          "claimReference": string?,
-          "url": string,
-          "ratingStance": "Mostly Support" | "Partially Support" | "Opposite",
-          "snippet": string,
-          "datePosted": string
-        }
-      ]
+      "searchQuery": string
     }
   ]
 }
 
 Requirements:
-- "confidenceScores" = overall confidence in your fact-checking (0-100).
-- "reasoning" should be a brief summary (around 50 words) explaining your overall analysis approach and key findings.
+- "confidenceScores" = overall confidence in the factual accuracy (0-100).
+- "reasoning" should be a brief summary (around 50 words) explaining your analysis.
 
 CRITICAL REQUIREMENT - You MUST return ALL segments:
 - "segments" array MUST contain EVERY SINGLE segment from the input, in the SAME order.
@@ -130,20 +183,17 @@ CRITICAL REQUIREMENT - You MUST return ALL segments:
 - Most segments will NOT have claims - that's normal and expected.
 
 For segments with factual claims:
-  - "claim" should be the EXACT text of the claim from that segment (can be a phrase or full sentence).
-  - "claimIndex" should match the index in "sourcesList" (starting from 0).
+  - "claim" should be the EXACT text of the claim from that segment.
+  - "claimIndex" should match the index in "claims" array (starting from 0).
 
-- "sourcesList" should provide sources for each unique claim identified.
-- For each source:
-  - "snippet" is a short excerpt from the source supporting your analysis.
-  - "ratingStance" is your evaluation of the source's position relative to the claim.
-  - "ratingPercent" is your confidence in that specific claim (0-100).
-  - "url" is the direct link to the source.
-  - "title" is the title of the source article or page.
-  - "datePosted" is the publication date of the source.
-  - "claimReference" is optional; include it if the source explicitly references the claim.
+- "claims" array should list each unique claim identified with:
+  - "claim": The claim being checked
+  - "claimText": The exact text from the transcript
+  - "confidenceReason": Why you rate this claim at this confidence
+  - "ratingPercent": Your confidence in this claim (0-100)
+  - "searchQuery": A good search query to find sources about this claim
 
-If you are uncertain or have limited information, lower ratingPercent and explain why in confidenceReason.
+Focus on identifying verifiable factual claims - dates, statistics, events, scientific facts, etc.
 """
 
 
@@ -153,7 +203,8 @@ def run_video_transcript_analysis_with_openai(
 ) -> VideoTranscriptAnalysisResponse:
     """
     Analyzes video transcript segments and identifies claims with sources.
-    Only analyzes the first 2 minutes to save on API costs.
+    Only analyzes the first 3 minutes to save on API costs.
+    Uses real search to find verified sources for claims.
     """
     # Convert segments to dict for JSON serialization
     all_segments_data = [
@@ -166,14 +217,14 @@ def run_video_transcript_analysis_with_openai(
         for seg in segments
     ]
 
-    # Filter to only first 2 minutes (120 seconds) for OpenAI analysis
+    # Filter to only first 3 minutes (180 seconds) for OpenAI analysis
     MAX_DURATION_SECONDS = 180
     segments_to_analyze = [
         seg for seg in all_segments_data
         if seg["startTime"] < MAX_DURATION_SECONDS
     ]
 
-    print(f"\n>>> Total segments: {len(all_segments_data)}, analyzing first 2 minutes: {len(segments_to_analyze)} segments")
+    print(f"\n>>> Total segments: {len(all_segments_data)}, analyzing first 3 minutes: {len(segments_to_analyze)} segments")
     print(f">>> First segment: {segments_to_analyze[0] if segments_to_analyze else 'None'}")
     print(f">>> Last segment to analyze: {segments_to_analyze[-1] if segments_to_analyze else 'None'}")
 
@@ -198,20 +249,76 @@ def run_video_transcript_analysis_with_openai(
 
     try:
         data: Dict[str, Any] = json.loads(raw)
-        print(f"Parsed data: videoId={data.get('videoId')}, segments={len(data.get('segments', []))}, sourcesList={len(data.get('sourcesList', []))}")
+        print(f"Parsed data: videoId={data.get('videoId')}, segments={len(data.get('segments', []))}, claims={len(data.get('claims', []))}")
 
-        # Merge analyzed segments with remaining segments (after 2 minutes)
+        # Merge analyzed segments with remaining segments (after 3 minutes)
         analyzed_segments = data.get('segments', [])
         remaining_segments = [
             seg for seg in all_segments_data
             if seg["startTime"] >= MAX_DURATION_SECONDS
         ]
 
-        # Combine: analyzed segments (first 2 min) + remaining segments (rest of video)
+        # Combine: analyzed segments (first 3 min) + remaining segments (rest of video)
         all_segments_with_claims = analyzed_segments + remaining_segments
         data['segments'] = all_segments_with_claims
 
         print(f"Final: {len(analyzed_segments)} analyzed + {len(remaining_segments)} remaining = {len(all_segments_with_claims)} total segments")
+
+        # Now search for real sources for each identified claim
+        claims = data.get("claims", [])
+        sources_list = []
+        
+        for i, claim_data in enumerate(claims):
+            claim_text = claim_data.get("claim", "")
+            search_query = claim_data.get("searchQuery", claim_text)
+            
+            print(f"Searching for claim {i}: {claim_text[:50]}...")
+            
+            # Search for real sources using Tavily
+            search_results = search_for_claim(
+                search_query,
+                max_results=3,
+                include_domains=TRUSTED_FACT_CHECK_DOMAINS[:10]
+            )
+            
+            # Convert search results to our source format
+            sources = []
+            for result in search_results:
+                score = result.get("score", 0)
+                if score > 0.8:
+                    stance = "Mostly Support"
+                elif score > 0.5:
+                    stance = "Partially Support"
+                else:
+                    stance = "Partially Support"
+                    
+                sources.append({
+                    "title": result.get("title", "Unknown Source"),
+                    "url": result.get("url", ""),
+                    "snippet": result.get("snippet", ""),
+                    "datePosted": result.get("published_date", "Unknown"),
+                    "ratingStance": stance,
+                    "claimReference": claim_data.get("claimText", ""),
+                })
+            
+            if not sources:
+                sources.append({
+                    "title": "No verified sources found",
+                    "url": "",
+                    "snippet": "Unable to find verified sources for this claim. Please verify independently.",
+                    "datePosted": "",
+                    "ratingStance": "Partially Support",
+                    "claimReference": claim_data.get("claimText", ""),
+                })
+            
+            sources_list.append({
+                "claim": claim_text,
+                "confidenceReason": claim_data.get("confidenceReason", ""),
+                "ratingPercent": claim_data.get("ratingPercent", 50),
+                "sources": sources,
+            })
+        
+        data['sourcesList'] = sources_list
 
     except json.JSONDecodeError as e:
         # Fallback if OpenAI returns invalid JSON

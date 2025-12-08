@@ -1,10 +1,10 @@
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 from typing import List, Optional
 
 
 class Source(BaseModel):
     title: str
-    url: HttpUrl
+    url: str  # Allow empty string when no source found
     ratingStance: str
     snippet: str
     datePosted: str
