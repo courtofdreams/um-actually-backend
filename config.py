@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     # Sign up for free tier at https://app.tavily.com/sign-up
     TAVILY_API_KEY: str = "your-tavily-api-key-here"
     
+    # YouTube cookies for yt-dlp authentication (base64 encoded)
+    # Export from browser, then: base64 < cookies.txt
+    # This helps bypass YouTube bot detection on cloud servers
+    YOUTUBE_COOKIES_BASE64: str = ""
+    
     class Config:
         env_file = ".env"
 

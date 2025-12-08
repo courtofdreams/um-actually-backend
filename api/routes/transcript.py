@@ -1,19 +1,59 @@
-
-
+import os
+import base64
+import tempfile
 from fastapi import APIRouter, HTTPException
-from typing import List
+from typing import List, Optional
 from schemas.transcript import TranscriptRequest, TranscriptResponse, TranscriptSegment
 import logging
 import yt_dlp
+from config import settings
+
 router = APIRouter()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global cookie file path (created once at startup if cookies are configured)
+_cookie_file_path: Optional[str] = None
+
+
+def get_cookie_file_path() -> Optional[str]:
+    """
+    Decode base64 YouTube cookies from environment and write to temp file.
+    Returns the path to the cookie file, or None if not configured.
+    """
+    global _cookie_file_path
+    
+    # Return cached path if already created
+    if _cookie_file_path and os.path.exists(_cookie_file_path):
+        return _cookie_file_path
+    
+    cookies_b64 = settings.YOUTUBE_COOKIES_BASE64
+    if not cookies_b64 or cookies_b64 == "":
+        logger.info("No YouTube cookies configured - running without authentication")
+        return None
+    
+    try:
+        # Decode base64 cookies
+        cookies_content = base64.b64decode(cookies_b64).decode('utf-8')
+        
+        # Write to temp file
+        fd, path = tempfile.mkstemp(suffix='.txt', prefix='yt_cookies_')
+        with os.fdopen(fd, 'w') as f:
+            f.write(cookies_content)
+        
+        _cookie_file_path = path
+        logger.info(f"YouTube cookies loaded successfully")
+        return path
+    except Exception as e:
+        logger.error(f"Failed to decode YouTube cookies: {e}")
+        return None
+
 
 @router.post("/transcript")
 async def get_transcript(request: TranscriptRequest) -> TranscriptResponse:
     """
     Fetch YouTube video captions using yt-dlp.
-    No authentication required - works for any video with subtitles.
+    Uses cookies for authentication if configured to bypass bot detection.
 
     Args:
         request: Contains videoUrl and videoId
@@ -31,6 +71,12 @@ async def get_transcript(request: TranscriptRequest) -> TranscriptResponse:
             'writesubtitles': True,
             'subtitle': ['en'],
         }
+        
+        # Add cookies if available (helps bypass bot detection)
+        cookie_file = get_cookie_file_path()
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info("Using YouTube cookies for authentication")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:

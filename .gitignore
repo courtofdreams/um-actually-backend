@@ -38,3 +38,5 @@ pytest_cache/
 build/
 dist/
 site/
+
+cookies.txt

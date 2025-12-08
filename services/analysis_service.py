@@ -1,5 +1,6 @@
 import json
 from typing import Dict, Any, List
+from datetime import datetime
 
 from schemas.text_analysis import TextAnalysisResponse
 from schemas.video_analysis import VideoTranscriptAnalysisResponse, TranscriptSegment
@@ -7,29 +8,39 @@ from services.openai_service import run_text_analysis
 from services.search_service import search_for_claim, TRUSTED_FACT_CHECK_DOMAINS
 
 
+def get_current_date_string() -> str:
+    """Get the current date formatted for prompt injection."""
+    return datetime.now().strftime("%B %d, %Y")
+
+
 # Updated prompt that focuses on identifying claims, not generating URLs
-TEXT_ANALYSIS_SYSTEM_PROMPT = """
+TEXT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE = """
 You are a fact-checking and text analysis assistant.
+
+IMPORTANT: Today's date is {current_date}. Your training data may be outdated.
+When assessing claims about recent events, do NOT mark them as "future events" or "unverifiable" 
+simply because they occurred after your training cutoff. Real-time search results will be used
+to verify these claims, and you should generate appropriate search queries for them.
 
 Your job is to identify factual claims in the text and assess their verifiability.
 DO NOT make up URLs or sources - real sources will be found separately.
 
 Return ONLY a single JSON object with this exact structure:
 
-{
+{{
   "confidenceScores": number,
   "reasoning": string,
   "htmlContent": string,
   "claims": [
-    {
+    {{
       "claim": string,
       "claimText": string,
       "confidenceReason": string,
       "ratingPercent": number,
       "searchQuery": string
-    }
+    }}
   ]
-}
+}}
 
 Requirements:
 - "confidenceScores" = overall confidence in the factual accuracy of the WHOLE text (0-100).
@@ -39,19 +50,27 @@ Requirements:
   - "claim": The claim being checked (e.g., "The UK left the EU in 2020")
   - "claimText": The exact text from the source that contains this claim
   - "confidenceReason": Why you rate this claim at this confidence level
-  - "ratingPercent": Your confidence in this claim (0-100) based on your knowledge
+  - "ratingPercent": Your confidence in this claim (0-100) based on your knowledge AND the fact that recent events will be verified via real-time search
   - "searchQuery": A good search query to find sources about this claim (for fact-checking)
 
-If you are uncertain or have limited information, lower ratingPercent and explain why in confidenceReason.
+For recent events (within the last 1-2 years), set a moderate confidence (40-60%) and note that 
+verification depends on search results. Do NOT automatically give low confidence just because 
+the event is recent or outside your training data.
+
 Focus on identifying verifiable factual claims - dates, statistics, events, scientific facts, etc.
 """
 
 
 def run_text_analysis_with_openai(text: str) -> TextAnalysisResponse:
     user_payload = {"text": text}
+    
+    # Format the prompt with the current date
+    system_prompt = TEXT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE.format(
+        current_date=get_current_date_string()
+    )
 
     raw = run_text_analysis(
-        system_prompt=TEXT_ANALYSIS_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_payload=user_payload,
         model="gpt-4.1",
         temperature=0.1,
@@ -132,8 +151,13 @@ def run_text_analysis_with_openai(text: str) -> TextAnalysisResponse:
 
 
 # Updated video transcript prompt - focuses on claim identification
-VIDEO_TRANSCRIPT_ANALYSIS_SYSTEM_PROMPT = """
+VIDEO_TRANSCRIPT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE = """
 You are a fact-checking assistant for video transcript analysis.
+
+IMPORTANT: Today's date is {current_date}. Your training data may be outdated.
+When assessing claims about recent events, do NOT mark them as "future events" or "unverifiable" 
+simply because they occurred after your training cutoff. Real-time search results will be used
+to verify these claims, and you should generate appropriate search queries for them.
 
 You will receive a list of transcript segments with timestamps. Each segment has:
 - id: unique identifier
@@ -146,30 +170,30 @@ DO NOT make up URLs or sources - real sources will be found separately.
 
 Return ONLY a single JSON object with this exact structure:
 
-{
+{{
   "videoId": string,
   "confidenceScores": number,
   "reasoning": string,
   "segments": [
-    {
+    {{
       "id": string,
       "text": string,
       "startTime": number,
       "endTime": number,
       "claim": string (optional),
       "claimIndex": number (optional)
-    }
+    }}
   ],
   "claims": [
-    {
+    {{
       "claim": string,
       "claimText": string,
       "confidenceReason": string,
       "ratingPercent": number,
       "searchQuery": string
-    }
+    }}
   ]
-}
+}}
 
 Requirements:
 - "confidenceScores" = overall confidence in the factual accuracy (0-100).
@@ -178,7 +202,7 @@ Requirements:
 CRITICAL REQUIREMENT - You MUST return ALL segments:
 - "segments" array MUST contain EVERY SINGLE segment from the input, in the SAME order.
 - Count the input segments and return the EXACT same number.
-- For segments WITHOUT claims: include them with only {id, text, startTime, endTime}.
+- For segments WITHOUT claims: include them with only {{id, text, startTime, endTime}}.
 - For segments WITH claims: add "claim" and "claimIndex" fields.
 - Most segments will NOT have claims - that's normal and expected.
 
@@ -190,8 +214,12 @@ For segments with factual claims:
   - "claim": The claim being checked
   - "claimText": The exact text from the transcript
   - "confidenceReason": Why you rate this claim at this confidence
-  - "ratingPercent": Your confidence in this claim (0-100)
+  - "ratingPercent": Your confidence in this claim (0-100) - for recent events, use moderate confidence (40-60%) as real-time search will verify
   - "searchQuery": A good search query to find sources about this claim
+
+For recent events (within the last 1-2 years), set a moderate confidence (40-60%) and note that 
+verification depends on search results. Do NOT automatically give low confidence just because 
+the event is recent or outside your training data.
 
 Focus on identifying verifiable factual claims - dates, statistics, events, scientific facts, etc.
 """
@@ -233,8 +261,13 @@ def run_video_transcript_analysis_with_openai(
         "segments": segments_to_analyze
     }
 
+    # Format the prompt with the current date
+    system_prompt = VIDEO_TRANSCRIPT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE.format(
+        current_date=get_current_date_string()
+    )
+
     raw = run_text_analysis(
-        system_prompt=VIDEO_TRANSCRIPT_ANALYSIS_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_payload=user_payload,
         model="gpt-4.1",
         temperature=0.1,
