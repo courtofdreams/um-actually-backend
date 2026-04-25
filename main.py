@@ -17,7 +17,8 @@ app = FastAPI(
 
 origins = [
     "https://um-actually-frontend.fly.dev",
-    "http://localhost:3000"
+    "http://localhost:3000",
+    "http://localhost:3001",
 ]
 
 app.add_middleware(

@@ -1,6 +1,15 @@
+"""
+Um, Actually — Backend Analysis Service
+4-agent pipeline: Orchestrator → [Claim Extractor ‖ Search Agent] → Verifier + Explainer
+
+All public functions return plain dicts (JSON-serialisable).
+"""
+
+from __future__ import annotations
+
 import json
-from typing import Dict, Any, List
 from datetime import datetime
+from typing import Any
 
 from schemas.text_analysis import TextAnalysisResponse
 from schemas.video_analysis import VideoTranscriptAnalysisResponse, TranscriptSegment
@@ -8,360 +17,421 @@ from services.openai_service import run_text_analysis
 from services.search_service import search_for_claim, TRUSTED_FACT_CHECK_DOMAINS
 
 
-def get_current_date_string() -> str:
-    """Get the current date formatted for prompt injection."""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _today() -> str:
     return datetime.now().strftime("%B %d, %Y")
 
 
-# Updated prompt that focuses on identifying claims, not generating URLs
-TEXT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE = """
-You are a fact-checking and text analysis assistant.
+def _safe_json(raw: str, fallback: dict) -> dict:
+    """Parse JSON, stripping markdown fences if the model wrapped the output."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # Strip ```json ... ``` or ``` ... ```
+        lines = cleaned.splitlines()
+        cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return fallback
 
-IMPORTANT: Today's date is {current_date}. Your training data may be outdated.
-When assessing claims about recent events, do NOT mark them as "future events" or "unverifiable" 
-simply because they occurred after your training cutoff. Real-time search results will be used
-to verify these claims, and you should generate appropriate search queries for them.
 
-Your job is to identify factual claims in the text and assess their verifiability.
-DO NOT make up URLs or sources - real sources will be found separately.
+# ---------------------------------------------------------------------------
+# Claim type classification helpers
+# ---------------------------------------------------------------------------
 
-Return ONLY a single JSON object with this exact structure:
+CLAIM_TYPE_VERIFIABLE = "verifiable"
+CLAIM_TYPE_ANONYMOUS  = "anonymous_source"
+CLAIM_TYPE_INFERENCE  = "subjective_inference"
+
+# Confidence ceiling per claim type — used by the Verifier agent to cap scores
+# and to generate honest explanations for the UI.
+CONFIDENCE_CEILING: dict[str, int] = {
+    CLAIM_TYPE_VERIFIABLE: 95,
+    CLAIM_TYPE_ANONYMOUS:  60,
+    CLAIM_TYPE_INFERENCE:  55,
+}
+
+CLAIM_TYPE_EXPLANATION: dict[str, str] = {
+    CLAIM_TYPE_VERIFIABLE: (
+        "This is a verifiable factual claim. Confidence is based on available "
+        "public sources and may be updated by real-time search results."
+    ),
+    CLAIM_TYPE_ANONYMOUS: (
+        "This claim originates from an unnamed or anonymous source. AI cannot "
+        "cross-reference anonymous insider claims against public records. "
+        "A confidence score above 60% is structurally impossible regardless of "
+        "how many sources are found — treat this as unverified unless corroborated "
+        "by a named, accountable source."
+    ),
+    CLAIM_TYPE_INFERENCE: (
+        "This is a subjective interpretation or inference rather than a concrete "
+        "factual claim. Confidence reflects how widely the interpretation is shared, "
+        "not verifiable truth."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Agent 2 — Claim Extractor prompt
+# ---------------------------------------------------------------------------
+
+_CLAIM_EXTRACTOR_PROMPT = """
+You are Agent 2 (Claim Extractor) in a multi-agent fact-checking system.
+
+Today's date: {today}
+
+YOUR ONLY JOB is to identify and classify factual claims in the text.
+Do NOT invent sources or URLs.
+
+Classify every claim as ONE of:
+  - "verifiable"          — a concrete, publicly checkable fact (date, statistic, named event)
+  - "anonymous_source"    — originates from an unnamed/insider/unnamed-insider source
+  - "subjective_inference"— an opinion, characterisation, or interpretation framed as fact
+
+Return ONLY valid JSON — no markdown fences, no prose before or after.
 
 {{
-  "confidenceScores": number,
-  "reasoning": string,
-  "htmlContent": string,
   "claims": [
     {{
-      "claim": string,
-      "claimText": string,
-      "confidenceReason": string,
-      "ratingPercent": number,
-      "searchQuery": string
+      "claimIndex": 0,
+      "claim": "Short label for the claim",
+      "claimText": "Exact verbatim text from the source",
+      "claimType": "verifiable | anonymous_source | subjective_inference",
+      "initialConfidence": <integer 0-100>,
+      "confidenceReason": "Why this confidence, and what limits it",
+      "searchQuery": "Best web search query to verify this claim"
     }}
   ]
 }}
 
-Requirements:
-- "confidenceScores" = overall confidence in the factual accuracy of the WHOLE text (0-100).
-- "htmlContent" should be the full text with inline markers from claim to numbers [1], [2], [3]... wrapped in <span class="marker"> claim [1] </span>. DO NOT add markers for sentences without factual claims.
-- "reasoning" should explain your overall analysis approach and findings.
-- "claims" should list each identified claim with:
-  - "claim": The claim being checked (e.g., "The UK left the EU in 2020")
-  - "claimText": The exact text from the source that contains this claim
-  - "confidenceReason": Why you rate this claim at this confidence level
-  - "ratingPercent": Your confidence in this claim (0-100) based on your knowledge AND the fact that recent events will be verified via real-time search
-  - "searchQuery": A good search query to find sources about this claim (for fact-checking)
+Rules:
+- Only extract claims with meaningful factual content (skip filler, opinions clearly marked as such).
+- For recent events (< 2 years old) use initialConfidence 40-60 — search results will refine it.
+- For anonymous_source claims, cap initialConfidence at 60.
+- For subjective_inference claims, cap initialConfidence at 55.
+- claimIndex must start at 0 and be sequential.
+"""
 
-For recent events (within the last 1-2 years), set a moderate confidence (40-60%) and note that 
-verification depends on search results. Do NOT automatically give low confidence just because 
-the event is recent or outside your training data.
+_HTML_MARKER_PROMPT = """
+You are a text formatter. You will receive:
+1. The original text
+2. A list of claims with their claimIndex and claimText
 
-Focus on identifying verifiable factual claims - dates, statistics, events, scientific facts, etc.
+Return ONLY valid JSON — no markdown fences.
+
+{{
+  "htmlContent": "<p>Text with <span class=\\"marker\\">claim text [1]</span> inline markers...</p>",
+  "overallConfidence": <integer 0-100>,
+  "overallReasoning": "2-3 sentence summary of the text's factual reliability"
+}}
+
+Rules:
+- Wrap ONLY the exact claimText in <span class="marker">...</span> and append [N] where N = claimIndex + 1.
+- Do not add markers where there is no claim.
+- overallConfidence is your assessment of the whole text's factual reliability (0-100).
 """
 
 
-def run_text_analysis_with_openai(text: str) -> TextAnalysisResponse:
-    user_payload = {"text": text}
-    
-    # Format the prompt with the current date
-    system_prompt = TEXT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE.format(
-        current_date=get_current_date_string()
-    )
+# ---------------------------------------------------------------------------
+# Agent 3 — Search Agent
+# ---------------------------------------------------------------------------
 
-    raw = run_text_analysis(
-        system_prompt=system_prompt,
-        user_payload=user_payload,
-        model="gpt-4.1",
-        temperature=0.1,
-    )
+def _search_for_claims(claims: list[dict]) -> list[dict]:
+    """
+    Agent 3: For each claim, search for real sources.
+    Returns an enriched list with a 'sources' key added to each claim.
+    """
+    enriched = []
+    top_domains = TRUSTED_FACT_CHECK_DOMAINS[:10]
 
-    try:
-        data: Dict[str, Any] = json.loads(raw)
-    except json.JSONDecodeError:
-        data = {
-            "confidenceScores": 0,
-            "reasoning": "Model returned invalid JSON.",
-            "htmlContent": text,
-            "claims": [],
-        }
+    for claim_data in claims:
+        query = claim_data.get("searchQuery") or claim_data.get("claim", "")
+        results = search_for_claim(query, max_results=3, include_domains=top_domains)
 
-    # Now search for real sources for each claim
-    claims = data.get("claims", [])
-    sources_list = []
-    
-    for i, claim_data in enumerate(claims):
-        claim_text = claim_data.get("claim", "")
-        search_query = claim_data.get("searchQuery", claim_text)
-        
-        # Search for real sources using Tavily
-        search_results = search_for_claim(
-            search_query,
-            max_results=3,
-            include_domains=TRUSTED_FACT_CHECK_DOMAINS[:10]  # Top trusted domains
-        )
-        
-        # Convert search results to our source format
         sources = []
-        for result in search_results:
-            # Determine stance based on search result score and content
-            # This is a heuristic - higher scores generally mean more relevant/supportive
-            score = result.get("score", 0)
+        for r in results:
+            score = r.get("score", 0)
             if score > 0.8:
                 stance = "Mostly Support"
             elif score > 0.5:
                 stance = "Partially Support"
+            elif score > 0.2:
+                stance = "Weakly Support"
             else:
-                stance = "Partially Support"  # Default to partial for found sources
-                
+                stance = "Insufficient Evidence"
+
             sources.append({
-                "title": result.get("title", "Unknown Source"),
-                "url": result.get("url", ""),
-                "snippet": result.get("snippet", ""),
-                "datePosted": result.get("published_date", "Unknown"),
-                "ratingStance": stance,
+                "title":          r.get("title", "Unknown Source"),
+                "url":            r.get("url", ""),
+                "snippet":        r.get("snippet", ""),
+                "datePosted":     r.get("published_date", ""),
+                "ratingStance":   stance,
                 "claimReference": claim_data.get("claimText", ""),
             })
-        
-        # If no sources found from search, note this
+
         if not sources:
             sources.append({
-                "title": "No verified sources found",
-                "url": "",
-                "snippet": "Unable to find verified sources for this claim. Please verify independently.",
-                "datePosted": "",
-                "ratingStance": "Partially Support",
+                "title":          "No verified sources found",
+                "url":            "",
+                "snippet":        (
+                    "Unable to find verified public sources. "
+                    "Verify this claim independently before treating it as fact."
+                ),
+                "datePosted":     "",
+                "ratingStance":   "Insufficient Evidence",
                 "claimReference": claim_data.get("claimText", ""),
             })
-        
+
+        enriched.append({**claim_data, "sources": sources})
+
+    return enriched
+
+
+# ---------------------------------------------------------------------------
+# Agent 4 — Verifier + Explainer
+# ---------------------------------------------------------------------------
+
+def _apply_trust_layer(claims_with_sources: list[dict]) -> list[dict]:
+    """
+    Agent 4: Cap confidence scores by claim type, attach structured AI-limitation
+    explanations, and produce the final sourcesList entries consumed by the UI.
+    """
+    sources_list = []
+
+    for c in claims_with_sources:
+        claim_type     = c.get("claimType", CLAIM_TYPE_VERIFIABLE)
+        raw_confidence = c.get("initialConfidence", 50)
+        ceiling        = CONFIDENCE_CEILING.get(claim_type, 95)
+
+        # Hard cap: anonymous/inference claims cannot exceed their ceiling
+        final_confidence = min(raw_confidence, ceiling)
+
+        # Build the human-readable confidence reason, always including the
+        # structural ceiling explanation for non-verifiable claim types
+        base_reason = c.get("confidenceReason", "")
+        type_explanation = CLAIM_TYPE_EXPLANATION.get(claim_type, "")
+
+        if claim_type != CLAIM_TYPE_VERIFIABLE:
+            confidence_reason = f"{base_reason}\n\n⚠ AI limitation: {type_explanation}"
+        else:
+            confidence_reason = base_reason
+
         sources_list.append({
-            "claim": claim_text,
-            "confidenceReason": claim_data.get("confidenceReason", ""),
-            "ratingPercent": claim_data.get("ratingPercent", 50),
-            "sources": sources,
+            "claim":            c.get("claim", ""),
+            "claimType":        claim_type,
+            "confidenceReason": confidence_reason,
+            "ratingPercent":    final_confidence,
+            "confidenceCeiling": ceiling,
+            "aiLimitation":     type_explanation,
+            "sources":          c.get("sources", []),
         })
-    
-    # Build final response
-    return TextAnalysisResponse(
-        confidenceScores=data.get("confidenceScores", 0),
-        reasoning=data.get("reasoning", ""),
-        htmlContent=data.get("htmlContent", text),
-        sourcesList=sources_list,
+
+    return sources_list
+
+
+# ---------------------------------------------------------------------------
+# Agent 1 — Orchestrator (text)
+# ---------------------------------------------------------------------------
+
+def run_text_analysis_with_openai(text: str) -> dict:
+    """
+    Orchestrates the 4-agent pipeline for plain text input.
+
+    Returns a plain dict (always JSON-serialisable):
+    {
+        "confidenceScores": int,
+        "reasoning":        str,
+        "htmlContent":      str,
+        "sourcesList": [
+            {
+                "claim":             str,
+                "claimType":         "verifiable|anonymous_source|subjective_inference",
+                "confidenceReason":  str,
+                "ratingPercent":     int,   # already capped by claim type
+                "confidenceCeiling": int,
+                "aiLimitation":      str,
+                "sources": [
+                    {
+                        "title":          str,
+                        "url":            str,
+                        "snippet":        str,
+                        "datePosted":     str,
+                        "ratingStance":   str,
+                        "claimReference": str,
+                    }
+                ]
+            }
+        ]
+    }
+    """
+    today = _today()
+
+    # ── Agent 2a: extract and classify claims ────────────────────────────────
+    extractor_raw = run_text_analysis(
+        system_prompt=_CLAIM_EXTRACTOR_PROMPT.format(today=today),
+        user_payload={"text": text},
+        model="gpt-4.1",
+        temperature=0.1,
     )
+    extractor_data = _safe_json(extractor_raw, {"claims": []})
+    claims: list[dict] = extractor_data.get("claims", [])
+
+    # ── Agent 2b: generate annotated HTML + overall score ────────────────────
+    marker_raw = run_text_analysis(
+        system_prompt=_HTML_MARKER_PROMPT,
+        user_payload={
+            "originalText": text,
+            "claims": [
+                {"claimIndex": c["claimIndex"], "claimText": c.get("claimText", "")}
+                for c in claims
+            ],
+        },
+        model="gpt-4.1",
+        temperature=0.0,
+    )
+    marker_data = _safe_json(marker_raw, {
+        "htmlContent":       text,
+        "overallConfidence": 0,
+        "overallReasoning":  "Could not generate annotated text.",
+    })
+
+    # ── Agent 3: search for sources (parallel in spirit; sequential here) ────
+    claims_with_sources = _search_for_claims(claims)
+
+    # ── Agent 4: apply trust layer + confidence ceilings ─────────────────────
+    sources_list = _apply_trust_layer(claims_with_sources)
+
+    return {
+        "confidenceScores": marker_data.get("overallConfidence", 0),
+        "reasoning":        marker_data.get("overallReasoning", ""),
+        "htmlContent":      marker_data.get("htmlContent", text),
+        "sourcesList":      sources_list,
+    }
 
 
-# Updated video transcript prompt - focuses on claim identification
-VIDEO_TRANSCRIPT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE = """
-You are a fact-checking assistant for video transcript analysis.
+# ---------------------------------------------------------------------------
+# Agent 1 — Orchestrator (video transcript)
+# ---------------------------------------------------------------------------
 
-IMPORTANT: Today's date is {current_date}. Your training data may be outdated.
-When assessing claims about recent events, do NOT mark them as "future events" or "unverifiable" 
-simply because they occurred after your training cutoff. Real-time search results will be used
-to verify these claims, and you should generate appropriate search queries for them.
+_VIDEO_CLAIM_EXTRACTOR_PROMPT = """
+You are Agent 2 (Claim Extractor) specialised in video transcript analysis.
 
-You will receive a list of transcript segments with timestamps. Each segment has:
-- id: unique identifier
-- text: the spoken text
-- startTime: start time in seconds
-- endTime: end time in seconds
+Today's date: {today}
 
-Your job is to identify factual claims that can be verified.
-DO NOT make up URLs or sources - real sources will be found separately.
+You receive a list of transcript segments. Your job:
+1. Return ALL segments unchanged — most have no claims.
+2. For segments containing a factual claim, add "claim", "claimType", and "claimIndex".
+3. Separately list each unique claim in the "claims" array.
 
-Return ONLY a single JSON object with this exact structure:
+Classify every claim as ONE of:
+  - "verifiable"           — publicly checkable fact
+  - "anonymous_source"     — unnamed/insider source
+  - "subjective_inference" — opinion presented as fact
+
+Return ONLY valid JSON — no markdown fences, no prose.
 
 {{
-  "videoId": string,
-  "confidenceScores": number,
-  "reasoning": string,
+  "videoId": "{video_id}",
+  "overallConfidence": <integer 0-100>,
+  "overallReasoning": "brief summary",
   "segments": [
     {{
-      "id": string,
-      "text": string,
-      "startTime": number,
-      "endTime": number,
-      "claim": string (optional),
-      "claimIndex": number (optional)
+      "id": "...",
+      "text": "...",
+      "startTime": 0,
+      "endTime": 5
+    }},
+    {{
+      "id": "...",
+      "text": "...",
+      "startTime": 5,
+      "endTime": 10,
+      "claim": "short label",
+      "claimType": "verifiable",
+      "claimIndex": 0
     }}
   ],
   "claims": [
     {{
-      "claim": string,
-      "claimText": string,
-      "confidenceReason": string,
-      "ratingPercent": number,
-      "searchQuery": string
+      "claimIndex": 0,
+      "claim": "short label",
+      "claimText": "exact verbatim text",
+      "claimType": "verifiable | anonymous_source | subjective_inference",
+      "initialConfidence": 55,
+      "confidenceReason": "explanation",
+      "searchQuery": "search query"
     }}
   ]
 }}
 
-Requirements:
-- "confidenceScores" = overall confidence in the factual accuracy (0-100).
-- "reasoning" should be a brief summary (around 50 words) explaining your analysis.
-
-CRITICAL REQUIREMENT - You MUST return ALL segments:
-- "segments" array MUST contain EVERY SINGLE segment from the input, in the SAME order.
-- Count the input segments and return the EXACT same number.
-- For segments WITHOUT claims: include them with only {{id, text, startTime, endTime}}.
-- For segments WITH claims: add "claim" and "claimIndex" fields.
-- Most segments will NOT have claims - that's normal and expected.
-
-For segments with factual claims:
-  - "claim" should be the EXACT text of the claim from that segment.
-  - "claimIndex" should match the index in "claims" array (starting from 0).
-
-- "claims" array should list each unique claim identified with:
-  - "claim": The claim being checked
-  - "claimText": The exact text from the transcript
-  - "confidenceReason": Why you rate this claim at this confidence
-  - "ratingPercent": Your confidence in this claim (0-100) - for recent events, use moderate confidence (40-60%) as real-time search will verify
-  - "searchQuery": A good search query to find sources about this claim
-
-For recent events (within the last 1-2 years), set a moderate confidence (40-60%) and note that 
-verification depends on search results. Do NOT automatically give low confidence just because 
-the event is recent or outside your training data.
-
-Focus on identifying verifiable factual claims - dates, statistics, events, scientific facts, etc.
+Rules:
+- Return EVERY segment from input, in order, even those without claims.
+- Cap initialConfidence at 60 for anonymous_source, 55 for subjective_inference.
+- For recent events use initialConfidence 40-60.
 """
+
+MAX_TRANSCRIPT_SECONDS = 180  # analyse only first 3 min to control cost
 
 
 def run_video_transcript_analysis_with_openai(
     video_id: str,
-    segments: List[TranscriptSegment]
-) -> VideoTranscriptAnalysisResponse:
+    segments: list[TranscriptSegment],
+) -> dict:
     """
-    Analyzes video transcript segments and identifies claims with sources.
-    Only analyzes the first 3 minutes to save on API costs.
-    Uses real search to find verified sources for claims.
-    """
-    # Convert segments to dict for JSON serialization
-    all_segments_data = [
-        {
-            "id": seg.id,
-            "text": seg.text,
-            "startTime": seg.startTime,
-            "endTime": seg.endTime
-        }
-        for seg in segments
-    ]
+    Orchestrates the 4-agent pipeline for video transcript input.
 
-    # Filter to only first 3 minutes (180 seconds) for OpenAI analysis
-    MAX_DURATION_SECONDS = 180
-    segments_to_analyze = [
-        seg for seg in all_segments_data
-        if seg["startTime"] < MAX_DURATION_SECONDS
-    ]
-
-    print(f"\n>>> Total segments: {len(all_segments_data)}, analyzing first 3 minutes: {len(segments_to_analyze)} segments")
-    print(f">>> First segment: {segments_to_analyze[0] if segments_to_analyze else 'None'}")
-    print(f">>> Last segment to analyze: {segments_to_analyze[-1] if segments_to_analyze else 'None'}")
-
-    user_payload = {
-        "videoId": video_id,
-        "segments": segments_to_analyze
+    Returns a plain dict (always JSON-serialisable):
+    {
+        "videoId":          str,
+        "confidenceScores": int,
+        "reasoning":        str,
+        "segments":         list[dict],   # all segments, some annotated with claim info
+        "sourcesList":      list[dict],   # same shape as text analysis
     }
+    """
+    today = _today()
 
-    # Format the prompt with the current date
-    system_prompt = VIDEO_TRANSCRIPT_ANALYSIS_SYSTEM_PROMPT_TEMPLATE.format(
-        current_date=get_current_date_string()
-    )
+    all_segments_data = [
+        {"id": s.id, "text": s.text, "startTime": s.startTime, "endTime": s.endTime}
+        for s in segments
+    ]
 
-    raw = run_text_analysis(
-        system_prompt=system_prompt,
-        user_payload=user_payload,
+    to_analyse   = [s for s in all_segments_data if s["startTime"] < MAX_TRANSCRIPT_SECONDS]
+    after_cutoff = [s for s in all_segments_data if s["startTime"] >= MAX_TRANSCRIPT_SECONDS]
+
+    # ── Agent 2: extract claims from first 3 min ─────────────────────────────
+    extractor_raw = run_text_analysis(
+        system_prompt=_VIDEO_CLAIM_EXTRACTOR_PROMPT.format(today=today, video_id=video_id),
+        user_payload={"videoId": video_id, "segments": to_analyse},
         model="gpt-4.1",
         temperature=0.1,
     )
+    data = _safe_json(extractor_raw, {
+        "videoId":          video_id,
+        "overallConfidence": 0,
+        "overallReasoning": "Model returned invalid JSON.",
+        "segments":         to_analyse,
+        "claims":           [],
+    })
 
-    # Log the raw OpenAI response for debugging
-    print("\n" + "="*80)
-    print("RAW OPENAI RESPONSE FOR VIDEO ANALYSIS:")
-    print("="*80)
-    print(raw)
-    print("="*80 + "\n")
+    # Merge analysed segments with the remainder of the video
+    analysed_segments  = data.get("segments", to_analyse)
+    full_segments      = analysed_segments + after_cutoff
+    claims: list[dict] = data.get("claims", [])
 
-    try:
-        data: Dict[str, Any] = json.loads(raw)
-        print(f"Parsed data: videoId={data.get('videoId')}, segments={len(data.get('segments', []))}, claims={len(data.get('claims', []))}")
+    # ── Agent 3: search ───────────────────────────────────────────────────────
+    claims_with_sources = _search_for_claims(claims)
 
-        # Merge analyzed segments with remaining segments (after 3 minutes)
-        analyzed_segments = data.get('segments', [])
-        remaining_segments = [
-            seg for seg in all_segments_data
-            if seg["startTime"] >= MAX_DURATION_SECONDS
-        ]
+    # ── Agent 4: apply trust layer ────────────────────────────────────────────
+    sources_list = _apply_trust_layer(claims_with_sources)
 
-        # Combine: analyzed segments (first 3 min) + remaining segments (rest of video)
-        all_segments_with_claims = analyzed_segments + remaining_segments
-        data['segments'] = all_segments_with_claims
-
-        print(f"Final: {len(analyzed_segments)} analyzed + {len(remaining_segments)} remaining = {len(all_segments_with_claims)} total segments")
-
-        # Now search for real sources for each identified claim
-        claims = data.get("claims", [])
-        sources_list = []
-        
-        for i, claim_data in enumerate(claims):
-            claim_text = claim_data.get("claim", "")
-            search_query = claim_data.get("searchQuery", claim_text)
-            
-            print(f"Searching for claim {i}: {claim_text[:50]}...")
-            
-            # Search for real sources using Tavily
-            search_results = search_for_claim(
-                search_query,
-                max_results=3,
-                include_domains=TRUSTED_FACT_CHECK_DOMAINS[:10]
-            )
-            
-            # Convert search results to our source format
-            sources = []
-            for result in search_results:
-                score = result.get("score", 0)
-                if score > 0.8:
-                    stance = "Mostly Support"
-                elif score > 0.5:
-                    stance = "Partially Support"
-                else:
-                    stance = "Partially Support"
-                    
-                sources.append({
-                    "title": result.get("title", "Unknown Source"),
-                    "url": result.get("url", ""),
-                    "snippet": result.get("snippet", ""),
-                    "datePosted": result.get("published_date", "Unknown"),
-                    "ratingStance": stance,
-                    "claimReference": claim_data.get("claimText", ""),
-                })
-            
-            if not sources:
-                sources.append({
-                    "title": "No verified sources found",
-                    "url": "",
-                    "snippet": "Unable to find verified sources for this claim. Please verify independently.",
-                    "datePosted": "",
-                    "ratingStance": "Partially Support",
-                    "claimReference": claim_data.get("claimText", ""),
-                })
-            
-            sources_list.append({
-                "claim": claim_text,
-                "confidenceReason": claim_data.get("confidenceReason", ""),
-                "ratingPercent": claim_data.get("ratingPercent", 50),
-                "sources": sources,
-            })
-        
-        data['sourcesList'] = sources_list
-
-    except json.JSONDecodeError as e:
-        # Fallback if OpenAI returns invalid JSON
-        print(f"ERROR: Failed to parse OpenAI JSON response: {e}")
-        data = {
-            "videoId": video_id,
-            "confidenceScores": 0,
-            "reasoning": "Model returned invalid JSON.",
-            "segments": all_segments_data,
-            "sourcesList": [],
-        }
-
-    return VideoTranscriptAnalysisResponse(**data)
+    return {
+        "videoId":          video_id,
+        "confidenceScores": data.get("overallConfidence", 0),
+        "reasoning":        data.get("overallReasoning", ""),
+        "segments":         full_segments,
+        "sourcesList":      sources_list,
+    }

@@ -22,8 +22,11 @@ class Source(BaseModel):
 
 class SourceGroup(BaseModel):
     claim: str
+    claimType: str
     confidenceReason: str
     ratingPercent: int
+    confidenceCeiling: int
+    aiLimitation: str
     sources: List[Source]
 
 
